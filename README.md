@@ -1,358 +1,185 @@
 # Audio Transcription Pipeline
 
-Production-ready audio transcription service built with **FastAPI** and **OpenAI Whisper**. Accepts WAV/MP3 uploads and returns structured JSON with transcripts, word-level timestamps, speaker segmentation, and metadata. Persists results in a database for later retrieval.
+A backend service that accepts audio files, transcribes them using OpenAI Whisper, and returns structured results with word-level timestamps, speaker segments, and confidence scores. Built with FastAPI, runs fully offline, and persists transcripts in a database for retrieval.
 
 ---
 
 ## Features
 
-- **Multi-format support** — WAV and MP3 input with automatic normalization to 16kHz mono
-- **Word-level timestamps** — Precise start/end time for every transcribed word
-- **Post-processing** — Filler word removal, punctuation correction, mock speaker segmentation
-- **Structured JSON output** — Consistent response schema with confidence scores and metadata
-- **Database persistence** — Transcripts stored in SQLAlchemy async DB (SQLite/PostgreSQL), retrievable by ID
-- **Production-hardened** — API key auth, rate limiting, request ID tracing, structured logging, global exception handling, CORS
-- **Async architecture** — Non-blocking transcription via thread pool executor with concurrency semaphore
-- **Retry logic** — Automatic retry with backoff on transient transcription failures
-- **CLI support** — Batch processing without running the API server
-- **Docker-ready** — Multi-stage build with pre-cached model and non-root user
+- Accepts WAV and MP3 — normalizes everything to 16kHz mono WAV before processing
+- Word-level timestamps from Whisper with `word_timestamps=True`
+- Async request handling — Whisper runs in a thread pool so the API stays responsive
+- Concurrency control via semaphore (default: 2 parallel jobs) to prevent OOM
+- Retry with backoff on transient transcription failures (2 retries, 1s delay)
+- Post-processing: filler word removal, punctuation correction, speaker segmentation (each toggleable)
+- Transcripts persisted to database, retrievable by ID
+- API key auth, per-IP rate limiting, request ID tracing on every response
+- CLI mode for batch processing without the server
 
 ---
 
 ## Architecture
 
 ```
-Audio File (WAV/MP3)
-        │
-        ▼
-┌──────────────────┐
-│   API Routes      │  Auth, rate limiting, request ID — thin controller
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Transcription     │  Orchestrates full pipeline + DB persistence
-│    Service        │
-└────────┬─────────┘
-         │
-    ┌────┼────────────────┐
-    ▼    ▼                ▼
-┌──────┐ ┌──────────┐ ┌──────────┐
-│Input │ │Transcriber│ │Post-     │
-│Handler│ │(Whisper)  │ │Processor │
-└──────┘ └──────────┘ └──────────┘
-                          │
-                          ▼
-                   ┌──────────┐
-                   │ Formatter │
-                   └──────┬───┘
-                          │
-                          ▼
-                   ┌──────────┐
-                   │ Database  │  SQLAlchemy async (SQLite / PostgreSQL)
-                   └──────────┘
+Request → Routes (auth, rate limit) → TranscriptionService → DB
+                                            │
+                              ┌──────────────┼──────────────┐
+                              ▼              ▼              ▼
+                        InputHandler    Transcriber    PostProcessor
+                        (validate,      (Whisper,      (fillers,
+                         convert)        retry)        punctuation)
+                                                           │
+                                                      Formatter → Response
 ```
 
-Each component is a standalone class with a single responsibility — independently testable, replaceable, and configurable.
+**Routes** are thin controllers — they parse HTTP, check auth, and delegate to the service.
+**TranscriptionService** orchestrates the pipeline: validate → transcribe → postprocess → format → persist.
+Each component is injected at startup and independently testable.
 
 ---
 
 ## Tech Stack
 
-| Component | Technology | Purpose |
-|---|---|---|
-| **API Framework** | FastAPI | Async HTTP server with auto-generated OpenAPI docs |
-| **STT Engine** | OpenAI Whisper | State-of-the-art speech recognition (local, offline) |
-| **Data Validation** | Pydantic v2 | Request/response schema enforcement |
-| **Database** | SQLAlchemy 2.0 (async) + aiosqlite | Transcript persistence (swappable to PostgreSQL) |
-| **Configuration** | pydantic-settings + python-dotenv | Environment-based config management |
-| **Authentication** | API key header (optional) | Protect endpoints when `API_KEY` is set |
-| **Logging** | Loguru | Structured JSON logging with rotation and retention |
-| **Rate Limiting** | SlowAPI | Per-IP request throttling |
-| **Middleware** | Request ID tracing | Distributed tracing via `X-Request-ID` header |
-| **Audio Processing** | pydub + ffmpeg | Format conversion and normalization |
-| **Testing** | pytest + pytest-asyncio + httpx | Async-compatible test suite (35 tests) |
+| What | Why |
+|---|---|
+| **FastAPI** | Async HTTP, auto-generated OpenAPI docs, dependency injection |
+| **OpenAI Whisper** | Best accuracy-to-cost ratio, runs offline, supports 99+ languages |
+| **SQLAlchemy 2.0 (async)** | Transcript persistence — SQLite for dev, PostgreSQL for prod |
+| **pydub + ffmpeg** | Audio format conversion and normalization |
+| **Loguru** | Structured JSON logging with rotation |
+| **SlowAPI** | Per-IP rate limiting |
+| **Pydantic v2** | Request/response validation and serialization |
+
+---
+
+## API
+
+### `POST /transcribe`
+
+Upload an audio file, get a transcript.
+
+```bash
+curl -X POST http://localhost:8000/transcribe \
+  -H "X-API-Key: your-key" \
+  -F "file=@recording.wav"
+```
+
+```json
+{
+  "transcript": "Hello, this is a test recording.",
+  "confidence": 0.98,
+  "language": "en",
+  "processing_time_seconds": 3.42,
+  "timestamps": [
+    {"word": "Hello", "start": 0.0, "end": 0.4}
+  ],
+  "segments": [
+    {"speaker": "Speaker 1", "text": "Hello, this is...", "start": 0.0, "end": 30.0}
+  ],
+  "metadata": {
+    "filename": "recording.wav",
+    "duration_seconds": 12.5,
+    "model_used": "whisper-tiny"
+  }
+}
+```
+
+Response includes an `X-Transcript-ID` header for later retrieval.
+
+### `GET /transcript/{id}`
+
+Retrieve a stored transcript by ID.
+
+### `GET /health`
+
+Returns `{"status": "healthy", "version": "1.0.0"}`. No auth required.
+
+---
+
+## Setup
+
+```bash
+cd transcription_pipeline
+python -m venv venv
+.\venv\Scripts\Activate.ps1          # Windows
+# source venv/bin/activate           # Linux/macOS
+
+pip install "setuptools<81" wheel
+pip install openai-whisper --no-build-isolation
+pip install -r requirements.txt
+
+copy .env.example .env               # then edit as needed
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Requires **ffmpeg** on your PATH (`choco install ffmpeg` / `brew install ffmpeg` / `apt install ffmpeg`).
+
+### Docker
+
+```bash
+docker build -t transcription-pipeline .
+docker run -p 8000:8000 -e WHISPER_MODEL_SIZE=tiny transcription-pipeline
+```
+
+### Tests
+
+```bash
+pytest -v   # 35 tests
+```
+
+---
+
+## Engineering Decisions
+
+**Why Whisper (local)?**
+No API costs, no data leaving the server, configurable model sizes for the speed/accuracy tradeoff. Runs fully offline.
+
+**How is concurrency handled?**
+Whisper is CPU-bound. It runs in `asyncio.run_in_executor()` so the event loop stays free. An `asyncio.Semaphore` caps concurrent jobs (default 2) to prevent memory exhaustion. SlowAPI rate-limits at the HTTP level.
+
+**Why is audio not stored?**
+Uploaded files are written to temp files, processed, and deleted in a `finally` block. Raw audio is large and often sensitive — storing it creates liability without clear benefit for this use case.
+
+**Why are transcripts stored?**
+So clients can retrieve results later via `GET /transcript/{id}`. Stored in SQLAlchemy async — SQLite for development, one config change to switch to PostgreSQL.
+
+**How are failures handled?**
+Transient errors (model glitches, corrupted segments) trigger up to 2 retries with 1s delay. Validation failures (wrong format, oversized) fail immediately with proper HTTP codes. A global exception handler ensures no raw stack traces reach clients.
+
+---
+
+## Limitations and Future Work
+
+- **No job queue** — transcription is synchronous per request. For production scale, add Celery/Redis so clients get a job ID and poll for results.
+- **Mock speaker segmentation** — splits by time intervals, not real diarization. Would need Pyannote or similar for actual multi-speaker attribution.
+- **No cloud storage** — audio normalization uses local temp files. For horizontal scaling, swap to S3 for intermediate storage.
+- **CPU only** — no GPU support. Adding CUDA or switching to `faster-whisper` (CTranslate2) would give 4-50x speedup.
+- **No caching** — duplicate audio gets transcribed again. Content-hash deduplication via Redis would fix this.
 
 ---
 
 ## Project Structure
 
 ```
-transcription_pipeline/
-├── app/
-│   ├── main.py               # FastAPI app, lifespan, middleware, global error handler
-│   ├── config.py             # Pydantic BaseSettings with env-based config
-│   ├── database.py           # Async SQLAlchemy engine, session factory, lifecycle
-│   ├── middleware.py         # Request ID tracing middleware
-│   ├── cli.py                # CLI for batch transcription
-│   ├── api/
-│   │   ├── routes.py         # POST /transcribe, GET /transcript/{id}, GET /health
-│   │   └── auth.py           # Optional API key authentication dependency
-│   ├── core/
-│   │   ├── input_handler.py  # File validation, size check, MP3 → WAV conversion
-│   │   ├── transcriber.py    # Async Whisper wrapper with retry + semaphore
-│   │   ├── postprocessor.py  # Filler removal, punctuation, speaker segmentation
-│   │   └── formatter.py      # Structured JSON output builder
-│   ├── models/
-│   │   ├── schemas.py        # Pydantic v2 request/response models
-│   │   └── transcript.py     # SQLAlchemy ORM model for transcript storage
-│   ├── services/
-│   │   └── transcription.py  # Service layer — orchestrates pipeline + persistence
-│   └── utils/
-│       └── logger.py         # Loguru structured logger setup
-├── tests/
-│   ├── conftest.py           # Shared test fixtures
-│   ├── test_api.py           # API endpoint tests (5 cases)
-│   ├── test_store.py         # Database storage tests (5 cases)
-│   ├── test_production.py    # Auth, request ID, middleware tests (6 cases)
-│   ├── test_postprocessor.py # Post-processor unit tests (12 cases)
-│   └── test_transcriber.py   # Transcriber unit tests (5 cases)
-├── Dockerfile                # Multi-stage build, non-root, pre-cached model
-├── .env.example              # Configuration template
-├── .gitignore
-├── requirements.txt
-├── pyproject.toml
-└── README.md
+app/
+├── main.py                 # App entry, lifespan, middleware, error handler
+├── config.py               # All settings from env vars
+├── database.py             # Async engine + session factory
+├── middleware.py            # X-Request-ID tracing
+├── api/
+│   ├── routes.py           # 3 endpoints (transcribe, transcript, health)
+│   └── auth.py             # Optional API key check
+├── core/
+│   ├── input_handler.py    # Validate + convert audio
+│   ├── transcriber.py      # Whisper wrapper (async, retry, semaphore)
+│   ├── postprocessor.py    # Text cleanup + segmentation
+│   └── formatter.py        # Build response model
+├── models/
+│   ├── schemas.py          # Pydantic request/response types
+│   └── transcript.py       # ORM model
+├── services/
+│   └── transcription.py    # Pipeline orchestration + DB persistence
+└── utils/
+    └── logger.py           # Loguru setup
+tests/                      # 35 tests (API, DB, auth, processing, transcriber)
 ```
-
----
-
-## Setup
-
-### Prerequisites
-
-- **Python 3.11+**
-- **ffmpeg** (required for audio processing)
-
-```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-
-# Windows (chocolatey)
-choco install ffmpeg
-```
-
-### Local Installation
-
-```bash
-cd transcription_pipeline
-
-# Create virtual environment
-python -m venv venv
-.\venv\Scripts\Activate.ps1       # Windows PowerShell
-# source venv/bin/activate        # Linux/macOS
-
-# Install dependencies
-pip install setuptools wheel
-pip install openai-whisper --no-build-isolation
-pip install -r requirements.txt
-
-# Configure
-copy .env.example .env
-# Edit .env as needed (model size, rate limits, etc.)
-```
-
-### Run the Server
-
-```bash
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-Interactive API docs: **http://127.0.0.1:8000/docs**
-
----
-
-## Usage
-
-### API — Transcribe a File
-
-**Request:**
-```bash
-curl -X POST http://127.0.0.1:8000/transcribe \
-  -H "X-API-Key: your-key-here" \
-  -F "file=@audio.wav;type=audio/wav"
-```
-
-> Omit `X-API-Key` if `API_KEY` is not set in your `.env`.
-
-**Response:**
-```json
-{
-  "transcript": "Hi there, this is a sample voice recording created for speech synthesis testing.",
-  "confidence": 0.9995,
-  "language": "en",
-  "processing_time_seconds": 12.34,
-  "timestamps": [
-    {"word": "Hi", "start": 0.0, "end": 0.3},
-    {"word": "there", "start": 0.3, "end": 0.72}
-  ],
-  "segments": [
-    {
-      "speaker": "Speaker 1",
-      "text": "Hi there, this is a sample voice recording...",
-      "start": 0.0,
-      "end": 30.0
-    }
-  ],
-  "metadata": {
-    "filename": "audio.wav",
-    "duration_seconds": 26.3,
-    "model_used": "whisper-tiny"
-  }
-}
-```
-
-The response includes an `X-Transcript-ID` header for later retrieval.
-
-### API — Retrieve a Transcript
-
-```bash
-curl http://127.0.0.1:8000/transcript/{transcript_id}
-```
-
-### API — Health Check
-
-```bash
-curl http://127.0.0.1:8000/health
-# {"status": "healthy", "version": "1.0.0"}
-```
-
-### CLI — Batch Processing
-
-```bash
-# Basic transcription
-python -m app.cli transcribe audio.wav
-
-# Custom model + output file
-python -m app.cli transcribe audio.mp3 --model small --output result.json
-
-# Disable post-processing steps
-python -m app.cli transcribe audio.wav --no-fillers --no-segmentation
-```
-
----
-
-## Docker
-
-### Build
-
-```bash
-docker build -t transcription-pipeline .
-```
-
-### Run
-
-```bash
-docker run -p 8000:8000 transcription-pipeline
-```
-
-### Override Configuration
-
-```bash
-docker run -p 8000:8000 \
-  -e WHISPER_MODEL_SIZE=base \
-  -e LOG_LEVEL=DEBUG \
-  -e RATE_LIMIT_PER_MINUTE=20 \
-  -e CORS_ORIGINS=https://app.example.com \
-  transcription-pipeline
-```
-
----
-
-## Testing
-
-```bash
-pytest -v
-```
-
-**35 tests** covering:
-- API endpoints: health, file validation (415), transcription with mocked service, JSON schema
-- Database storage: save/retrieve, missing ID, timestamps round-trip, transcript ID header
-- Production features: request ID middleware, API key auth (401/403/200)
-- Post-processing: filler removal (7 cases), punctuation correction (4 cases), speaker segmentation (3 cases)
-- Transcriber: model name, confidence computation, timestamp extraction, async transcribe
-
----
-
-## Configuration
-
-All settings via environment variables (`.env` file):
-
-| Variable | Default | Description |
-|---|---|---|
-| `WHISPER_MODEL_SIZE` | `base` | Model variant: `tiny`, `base`, `small`, `medium`, `large` |
-| `MAX_FILE_SIZE_BYTES` | `26214400` | Max upload size (25 MB) |
-| `RATE_LIMIT_PER_MINUTE` | `10` | API rate limit per IP |
-| `MAX_CONCURRENT_TRANSCRIPTIONS` | `2` | Concurrent Whisper inference limit (prevents OOM) |
-| `API_KEY` | *(empty)* | API key for auth (empty = auth disabled) |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./data/transcripts.db` | Async DB URL (swap to `postgresql+asyncpg://...` for production) |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
-| `LOG_DIR` | `logs` | Log file output directory |
-| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
-| `ENABLE_FILLER_REMOVAL` | `true` | Toggle filler word removal |
-| `ENABLE_PUNCTUATION_CORRECTION` | `true` | Toggle punctuation correction |
-| `ENABLE_SPEAKER_SEGMENTATION` | `true` | Toggle speaker segmentation |
-| `SPEAKER_SEGMENT_INTERVAL` | `30` | Segment interval in seconds |
-
----
-
-## Engineering Decisions
-
-### Why Whisper (local) over Alternatives?
-
-| Criteria | Whisper (local) | Vosk | Google STT API |
-|---|---|---|---|
-| Accuracy | State-of-the-art | Good | Excellent |
-| Offline | Yes | Yes | No |
-| Cost | Free (compute only) | Free | Pay-per-use |
-| Languages | 99+ | Limited | 120+ |
-| Privacy | Full control | Full control | Data leaves premises |
-
-**Decision:** Best accuracy-to-cost ratio. Runs fully offline — no API costs, no data privacy concerns, configurable model sizes for latency/accuracy tradeoff.
-
-### Async Design
-
-Whisper inference is CPU-bound. We use `asyncio.run_in_executor()` to offload transcription to a thread pool, keeping FastAPI responsive for health checks and concurrent requests. A semaphore (`max_concurrent_transcriptions`) prevents OOM under concurrent load.
-
-### Service Layer
-
-`TranscriptionService` orchestrates the full pipeline (validate → transcribe → postprocess → format → persist). Routes are thin controllers that handle only HTTP concerns. This separation makes the business logic testable without spinning up a web server.
-
-### Database-Backed Storage
-
-Transcripts are persisted to an async SQLAlchemy database (SQLite for development, swappable to PostgreSQL via `DATABASE_URL`). No data is written to disk as flat files — all state lives in the database. Timestamps and segments are stored as JSON columns for flexibility.
-
-### Post-Processing as Toggleable Steps
-
-Each step (filler removal, punctuation, segmentation) is independently configurable via environment variables — enables A/B testing, per-use-case tuning, and faster processing when only raw transcription is needed.
-
-### Language-Aware Processing
-
-Punctuation correction uses English-specific rules and is automatically skipped for non-English transcriptions to avoid garbling output.
-
----
-
-## Future Improvements
-
-1. **Real-time streaming** — WebSocket endpoint with chunked audio processing
-2. **Job queue** — Redis/Kafka for async batch processing with webhook callbacks
-3. **Speaker diarization** — Replace mock segmentation with Pyannote for real multi-speaker attribution
-4. **GPU acceleration** — CUDA support for 10-50x faster inference
-5. **faster-whisper** — CTranslate2 backend for 4x speed improvement at same accuracy
-6. **Caching** — Content-hash-based deduplication via Redis
-7. **Observability** — Prometheus metrics for latency histograms and error rates
-
----
-
-## Troubleshooting
-
-| Issue | Solution |
-|---|---|
-| `ModuleNotFoundError: No module named 'pkg_resources'` | Run `pip install "setuptools<81"` before installing whisper |
-| `Port 8000 already in use` | Kill the process: `netstat -ano \| findstr :8000` then `Stop-Process -Id <PID>` |
-| `ffmpeg not found` | Install ffmpeg and ensure it's in your PATH |
-| Slow transcription on CPU | Switch to `WHISPER_MODEL_SIZE=tiny` in `.env` for faster processing |
-| `SHA256 checksum mismatch` | Delete `~/.cache/whisper/` and retry — the model download was corrupted |
